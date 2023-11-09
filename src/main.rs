@@ -18,23 +18,31 @@ fn main() -> std::io::Result<()> {
     let root_page = mgr.alloc(&mut f, page::PageType::BtreePage);
     node.page_count = root_page.borrow().count;
 
-    let mut rec = table::Record::default();
-
-    rec.values
-        .push(table::Value::new(table::ValueType::Bytes, b"test"));
-    rec.values
-        .push(table::Value::new(table::ValueType::Bytes, b"test1"));
-
     let mut table = table::Table {
         root_node: node,
         ..Default::default()
     };
 
+    let mut rowid = 0;
+    for i in 0..512 {
+        let mut rec = table::Record::default();
+
+        rec.values.push(table::Value::new(
+            table::ValueType::Bytes,
+            format!("data{:?}", (i as u16).to_be_bytes()).as_bytes(),
+        ));
+        rec.values.push(table::Value::new(
+            table::ValueType::Bytes,
+            format!("data{:?}", (i as u16).to_be_bytes()).as_bytes(),
+        ));
+
+        rowid = table.insert(&mut f, &mut mgr, rec.clone());
+    }
+
     table.value_types.push(table::ValueType::Bytes);
     table.value_types.push(table::ValueType::Bytes);
-    let rowid = table.insert(&mut f, &mut mgr, rec);
     mgr.sync_all(&mut f)?;
-    let rec = table.query(&mut f, &mut mgr, rowid);
-    println!("{:?}", rec.values[0]);
+
+    println!("{:?}", table.query(&mut f, &mut mgr, rowid));
     Ok(())
 }

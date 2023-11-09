@@ -212,7 +212,6 @@ pub struct OverflowPage {
 #[derive(Default)]
 pub struct PageManage {
     pages: BTreeMap<u64, Rc<RefCell<Page>>>,
-    max_page: u64,
     pub cache_size: usize,
     cache_pages: Vec<u64>,
 }
@@ -229,17 +228,15 @@ impl PageManage {
             if let Some(page) = self.get(device, bitmap_count) {
                 bitmap_page.page = *page.borrow();
             } else {
-                self.alloc_with_count(device, bitmap_count, PageType::BitmapPage);
-                bitmap_page.page = *self.get(device, bitmap_count).unwrap().borrow();
+                bitmap_page.page = *self
+                    .alloc_with_count(device, bitmap_count, PageType::BitmapPage)
+                    .borrow();
             }
-            bitmap_page.set_used(bitmap_count); // set bitmap page as used
+            bitmap_page.set_used(0); // set bitmap page as used
             if let Some(count) = bitmap_page.find_unused() {
-                let count = count + bitmap_count;
                 bitmap_page.set_used(count);
-                self.get(device, bitmap_count)
-                    .unwrap()
-                    .borrow_mut()
-                    .modify(&bitmap_page.page.data);
+                self.modify(device, bitmap_count, &bitmap_page.page.data);
+                let count = count + bitmap_count;
                 return count;
             }
             bitmap_count += BITMAP_MANAGED_SIZE as u64 + 1;
@@ -250,22 +247,13 @@ impl PageManage {
     where
         D: Write + Read + Seek,
     {
-        if self.cache_pages.len() == self.cache_size {
-            self.sync_all(device).unwrap();
-            self.pages[&self.cache_pages[0]]
-                .borrow_mut()
-                .sync(device)
-                .unwrap();
-            self.pages.remove(&self.cache_pages[0]);
-            self.cache_pages.remove(0);
-        }
+        self.limit_cache(device);
         let count = self.find_unused_page(device);
         let page = Page::new(count, page_type);
         let count = page.count;
         self.cache_pages.push(count);
 
         self.pages.insert(page.count, Rc::new(RefCell::new(page)));
-        self.max_page += 1;
 
         Rc::clone(self.pages.get(&count).unwrap())
     }
@@ -279,21 +267,12 @@ impl PageManage {
     where
         D: Write + Read + Seek,
     {
-        if self.cache_pages.len() == self.cache_size {
-            self.sync_all(device).unwrap();
-            self.pages[&self.cache_pages[0]]
-                .borrow_mut()
-                .sync(device)
-                .unwrap();
-            self.pages.remove(&self.cache_pages[0]);
-            self.cache_pages.remove(0);
-        }
+        self.limit_cache(device);
         let page = Page::new(count, page_type);
         let count = page.count;
         self.cache_pages.push(count);
 
         self.pages.insert(page.count, Rc::new(RefCell::new(page)));
-        self.max_page += 1;
 
         Rc::clone(self.pages.get(&count).unwrap())
     }
@@ -306,18 +285,10 @@ impl PageManage {
             return Some(Rc::clone(page));
         }
         /* page does not loaded into memory */
-        if self.cache_pages.len() == self.cache_size {
-            self.sync_all(device).unwrap();
-            self.pages[&self.cache_pages[0]]
-                .borrow_mut()
-                .sync(device)
-                .unwrap();
-            self.pages.remove(&self.cache_pages[0]);
-            self.cache_pages.remove(0);
-        }
-        self.cache_pages.push(page_count);
+        self.limit_cache(device);
         let page_res = Page::load(device, page_count);
         if let Ok(page) = page_res {
+            self.cache_pages.push(page_count);
             self.pages.insert(page_count, Rc::new(RefCell::new(page)));
         } else {
             return None;
@@ -356,6 +327,7 @@ impl PageManage {
         loop {
             /* is a bitmap page */
             if page_count % BITMAP_MANAGED_SIZE as u64 + 1 == 0 {
+                page_count += 1;
                 continue;
             }
             if let Some(page) = self.get(device, page_count) {
@@ -379,5 +351,26 @@ impl PageManage {
             .unwrap()
             .borrow_mut()
             .modify(data);
+    }
+    /** Get page data */
+    pub fn get_data<D>(&mut self, device: &mut D, page_count: u64) -> [u8; PAGE_SIZE]
+    where
+        D: Write + Read + Seek,
+    {
+        self.get(device, page_count).unwrap().borrow().data
+    }
+    /** Limit the cache size to self.cache_size */
+    fn limit_cache<D>(&mut self, device: &mut D)
+    where
+        D: Write + Read + Seek,
+    {
+        if self.cache_pages.len() >= self.cache_size {
+            self.pages[&self.cache_pages[0]]
+                .borrow_mut()
+                .sync(device)
+                .unwrap();
+            self.pages.remove(&self.cache_pages[0]);
+            self.cache_pages.remove(0);
+        };
     }
 }

@@ -3,4 +3,8 @@ name = "database"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "31database"
+path = "src/main.rs"
+
 [dependencies]

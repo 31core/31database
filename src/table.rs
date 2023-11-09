@@ -10,13 +10,13 @@ pub fn location_from_u64(u64_val: u64) -> (u64, u8) {
     (u64_val >> 8, (u64_val & 255) as u8)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ValueType {
     Number,
     Bytes,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Value {
     pub value_type: ValueType,
     pub data: Vec<u8>,
@@ -31,57 +31,11 @@ impl Value {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, Debug)]
 pub struct Record {
     pub rowid: u64,
     pub values: Vec<Value>,
     pub location: Vec<(u64, u8)>,
-}
-
-impl Record {
-    /** Write a record into page */
-    pub fn write_to_page<D>(&self, device: &mut D, mgr: &mut PageManage)
-    where
-        D: Write + Read + Seek,
-    {
-        for (i, val) in self.values.iter().enumerate() {
-            let page = mgr.get(device, self.location[i].0).unwrap();
-            let mut content_page = ContentPage::load(&page.borrow().data);
-            content_page.entries[self.location[i].1 as usize].data = val.data.clone();
-            page.borrow_mut().modify(&content_page.dump());
-        }
-    }
-    /** Add a new record into page */
-    pub fn add_to_page<D>(
-        &mut self,
-        device: &mut D,
-        mgr: &mut PageManage,
-        value: Value,
-    ) -> std::result::Result<(), ()>
-    where
-        D: Write + Read + Seek,
-    {
-        let mut page_count = 0;
-        let mut content_page;
-        loop {
-            page_count = mgr.find_page_by_type(device, page_count + 1, PAGE_TYPEID_CONTENT);
-            content_page = ContentPage::load(&mgr.get(device, page_count).unwrap().borrow().data);
-            if value.data.len() <= PAGE_SIZE - content_page.total_size() {
-                break;
-            }
-        }
-        let entry = ContentEntry {
-            data: value.data.clone(),
-            ..Default::default()
-        };
-
-        content_page.push(entry)?;
-        self.values.push(value);
-        self.location
-            .push((page_count, (content_page.entries.len() - 1) as u8));
-        mgr.modify(device, page_count, &content_page.dump());
-        Ok(())
-    }
 }
 
 #[derive(Default)]
@@ -101,8 +55,7 @@ impl Table {
         let mut rec = Record::default();
 
         for i in 0..self.value_types.len() {
-            let content_page =
-                ContentPage::load(&mgr.get(device, content_page_count).unwrap().borrow().data);
+            let content_page = ContentPage::load(&mgr.get_data(device, content_page_count));
 
             if i < self.value_types.len() - 1 {
                 rec.values.push(Value::new(
@@ -129,13 +82,7 @@ impl Table {
     where
         D: Write + Read + Seek,
     {
-        let mut rowid = 0;
-        loop {
-            if self.root_node.find_id(device, mgr, rowid).is_none() {
-                break;
-            }
-            rowid += 1;
-        }
+        let rowid = self.root_node.find_unused(device, mgr);
 
         let mut page_count;
         page_count = mgr.find_page_by_type(device, 0, PAGE_TYPEID_CONTENT);
@@ -154,8 +101,7 @@ impl Table {
                 };
             }
 
-            let mut content_page =
-                ContentPage::load(&mgr.get(device, page_count).unwrap().borrow().data);
+            let mut content_page = ContentPage::load(&mgr.get_data(device, page_count));
             loop {
                 if content_page.push(entry.clone()).is_ok() {
                     mgr.modify(device, page_count, &content_page.dump());
@@ -178,9 +124,8 @@ impl Table {
                         );
                     } else {
                         let (last_page_count, offset) = location_from_u64(last_location.unwrap());
-                        let mut last_content_page = ContentPage::load(
-                            &mgr.get(device, last_page_count).unwrap().borrow().data,
-                        );
+                        let mut last_content_page =
+                            ContentPage::load(&mgr.get_data(device, last_page_count));
                         last_content_page.entries[offset as usize].data[0..8].copy_from_slice(
                             &location_to_u64(page_count, content_page.entries.len() as u8 - 1)
                                 .to_be_bytes(),
@@ -195,6 +140,7 @@ impl Table {
                     break;
                 }
                 page_count = mgr.find_page_by_type(device, page_count + 1, PAGE_TYPEID_CONTENT);
+                content_page = ContentPage::load(&mgr.get_data(device, page_count));
             }
         }
         rowid

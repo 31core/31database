@@ -77,8 +77,8 @@ impl BtreeNode {
     /** Push an id into the current node
      *
      * Return:
-     * * page count of the right node
-     * * node ID of the right node */
+     * * node ID of the right node
+     * * page count of the right node */
     fn part<D>(&mut self, device: &mut D, mgr: &mut PageManage) -> (u64, u64)
     where
         D: Write + Read + Seek,
@@ -95,7 +95,7 @@ impl BtreeNode {
 
         (*another.ids.first().unwrap(), another.page_count)
     }
-    /** Push an id into B-Tree */
+    /** Insert an id into B-Tree */
     pub fn insert_id<D>(&mut self, device: &mut D, mgr: &mut PageManage, id: u64, value: u64)
     where
         D: Write + Read + Seek,
@@ -117,6 +117,12 @@ impl BtreeNode {
             mgr.modify(device, self.page_count, &self.dump());
         }
     }
+    /** Insert an id
+     *
+     * Return:
+     * * node ID of the right node
+     * * page count of the right node
+     */
     fn insert_id_nontop<D>(
         &mut self,
         device: &mut D,
@@ -265,6 +271,57 @@ impl BtreeNode {
             }
         }
         None
+    }
+    /** 
+     * Return:
+     * * Unused id
+     * * useed id count (only a leaf node will returns this)
+     */
+    fn find_unused_nontop<D>(
+        &self,
+        device: &mut D,
+        mgr: &mut PageManage,
+    ) -> (Option<u64>, Option<u64>)
+    where
+        D: Write + Read + Seek,
+    {
+        if self.is_internal() {
+            for i in 0..self.len() {
+                let page = mgr.get(device, self.ptrs[i]).unwrap();
+                let child = Self::new(page.borrow().count, &page.borrow().data);
+                let result = child.find_unused_nontop(device, mgr);
+
+                if let Some(id) = result.0 {
+                    return (Some(id), None);
+                } else if let Some(id) = result.1 {
+                    if i < self.len() - 1 && id + 1 < self.ids[i + 1] || i == self.len() - 1 {
+                        return (Some(id + 1), None);
+                    }
+                }
+            }
+        } else if self.ids.len() > 1 {
+            for i in 0..self.ids.len() - 1 {
+                if self.ids[i] + 1 < self.ids[i + 1] {
+                    return (Some(self.ids[i] + 1), None);
+                }
+            }
+            return (None, Some(*self.ids.last().unwrap()));
+        }
+        (None, None)
+    }
+    /** Find unused id */
+    pub fn find_unused<D>(&self, device: &mut D, mgr: &mut PageManage) -> u64
+    where
+        D: Write + Read + Seek,
+    {
+        let result = self.find_unused_nontop(device, mgr);
+        if let Some(id) = result.0 {
+            id
+        } else if let Some(id) = result.1 {
+            id
+        } else {
+            0
+        }
     }
     pub fn is_internal(&self) -> bool {
         self.node_type == PAGE_TYPEID_BTREE_INTERNAL
