@@ -10,6 +10,10 @@ const BITMAP_MANAGED_SIZE: usize = PAGE_SIZE * 8;
 pub const PAGE_TYPEID_BTREE_INTERNAL: u8 = 1;
 pub const PAGE_TYPEID_BTREE_LEAF: u8 = 2;
 pub const PAGE_TYPEID_CONTENT: u8 = 3;
+pub const PAGE_TYPEID_OVERFLOW: u8 = 4;
+
+const OVERFLOWPAGE_AVAILABLE_SIZE: usize = PAGE_SIZE - 3;
+const OVERFLOWED_OVERFLOWPAGE_AVAILABLE_SIZE: usize = PAGE_SIZE - 3 - 8;
 
 #[derive(Clone, Copy)]
 pub enum PageType {
@@ -118,24 +122,92 @@ pub struct ContentEntry {
 }
 
 impl ContentEntry {
+    pub fn from_bytes<D>(device: &mut D, mgr: &mut PageManage, data: &[u8]) -> Self
+    where
+        D: Write + Read + Seek,
+    {
+        let mut entry = ContentEntry::default();
+
+        /* requires overflow page */
+        if data.len() > PAGE_SIZE - 5 {
+            entry.data = data[..PAGE_SIZE - 12].to_owned();
+            let mut data = &data[PAGE_SIZE - 12..];
+
+            let mut last_count = None;
+            let mut last_page: Option<OverflowPage> = None;
+            let mut overflow_page_count = mgr.alloc(device, PageType::OverflowPage).borrow().count;
+            entry.overflow_page = Some(overflow_page_count);
+            loop {
+                let mut overflow_page = OverflowPage::default();
+                if last_page.is_some() {
+                    let mut last = last_page.clone().unwrap();
+                    last.next = Some(overflow_page_count);
+                    last_page = Some(last);
+                }
+
+                overflow_page.put_data(data);
+                if let Some(count) = last_count {
+                    if let Some(page) = &last_page {
+                        mgr.modify(device, count, &page.dump());
+                    }
+                }
+
+                last_count = Some(overflow_page_count);
+                last_page = Some(overflow_page.clone());
+                data = &data[overflow_page.data.len()..];
+
+                if data.is_empty() {
+                    mgr.modify(device, overflow_page_count, &overflow_page.dump());
+                    break;
+                }
+                overflow_page_count = mgr.alloc(device, PageType::OverflowPage).borrow().count;
+            }
+        } else {
+            entry.data = data.to_owned();
+        }
+        entry
+    }
     /** Summary used size (not including overflowed part) */
     pub fn total_size(&self) -> usize {
         if self.overflow_page.is_none() {
-            8 + self.data.len()
+            2 + self.data.len()
         } else {
-            8 + 8 + self.data.len()
+            2 + 8 + self.data.len()
         }
     }
     pub fn precalculate_size(size: usize, overflowed: bool) -> usize {
         if overflowed {
-            size + 8 + 8
+            size + 2 + 8
         } else {
-            size + 8
+            size + 2
         }
     }
 }
 
 #[derive(Default, Debug)]
+/**
+ * # Data structure:
+ *
+ * |Start|End |Description|
+ * |-----|----|-----------|
+ * |0    |1   |Page type  |
+ * |1    |2   |Count of entries|
+ * |2    |4096|Entries    |
+ *
+ * ## Entry
+ * Entry:
+ *
+ * |Start|End|Description|
+ * |-----|---|-----------|
+ * |0    |2  |Lenth      |
+ *
+ * Entry with overflow pages:
+ *
+ * |Start|End|Description|
+ * |-----|---|-----------|
+ * |0    |2  |Lenth      |
+ * |2    |10 |Overflow page|
+ */
 pub struct ContentPage {
     pub entries: Vec<ContentEntry>,
 }
@@ -148,10 +220,10 @@ impl ContentPage {
         let mut ptr = 2;
         for _ in 0..entries_len {
             let mut entry = ContentEntry::default();
-            let mut size = u64::from_be_bytes(page_data[ptr..ptr + 8].try_into().unwrap());
-            ptr += 8;
-            if size >> 63 == 1 {
-                size &= !1u64.wrapping_shl(63);
+            let mut size = u16::from_be_bytes(page_data[ptr..ptr + 2].try_into().unwrap());
+            ptr += 2;
+            if size >> 15 == 1 {
+                size &= !0 << 1 >> 1;
                 entry.overflow_page = Some(u64::from_be_bytes(
                     page_data[ptr..ptr + 8].try_into().unwrap(),
                 ));
@@ -170,16 +242,16 @@ impl ContentPage {
         page_data[1] = self.entries.len() as u8;
         let mut ptr = 2;
         for entry in &self.entries {
-            let mut size = entry.data.len() as u64;
+            let mut size = entry.data.len() as u16;
             if let Some(overflow_page) = entry.overflow_page {
-                size |= 1 << 63;
-                page_data[ptr..ptr + 8].copy_from_slice(&size.to_be_bytes());
-                ptr += 8;
+                size |= 1 << 15;
+                page_data[ptr..ptr + 2].copy_from_slice(&size.to_be_bytes());
+                ptr += 2;
                 page_data[ptr..ptr + 8].copy_from_slice(&overflow_page.to_be_bytes());
                 ptr += 8;
             } else {
-                page_data[ptr..ptr + 8].copy_from_slice(&size.to_be_bytes());
-                ptr += 8;
+                page_data[ptr..ptr + 2].copy_from_slice(&size.to_be_bytes());
+                ptr += 2;
             }
             page_data[ptr..ptr + entry.data.len()].copy_from_slice(&entry.data);
             ptr += entry.data.len();
@@ -205,8 +277,50 @@ impl ContentPage {
     }
 }
 
+#[derive(Clone, Default, Debug)]
 pub struct OverflowPage {
-    page: Page,
+    pub data: Vec<u8>,
+    pub next: Option<u64>,
+}
+
+impl OverflowPage {
+    /** Load from bytes */
+    pub fn load(data: &[u8; PAGE_SIZE]) -> Self {
+        let mut page = Self::default();
+        let size = u16::from_be_bytes(data[1..3].try_into().unwrap());
+        if size >> 15 == 1 {
+            let size = size << 1 >> 1;
+            page.data = data[11..11 + size as usize].to_owned();
+            page.next = Some(u64::from_be_bytes(data[3..11].try_into().unwrap()));
+        } else {
+            page.data = data[3..3 + size as usize].to_owned();
+        }
+
+        page
+    }
+    /** Dump to bytes */
+    pub fn dump(&self) -> [u8; PAGE_SIZE] {
+        let mut data = [0; PAGE_SIZE];
+        data[0] = PAGE_TYPEID_OVERFLOW;
+        if let Some(next) = self.next {
+            data[1..3].copy_from_slice(&(self.data.len() as u16 | (1 << 15)).to_be_bytes()); // write size
+            data[3..11].copy_from_slice(&next.to_be_bytes()); // write the next overflow page
+            data[11..11 + self.data.len()].copy_from_slice(&self.data);
+        } else {
+            data[1..3].copy_from_slice(&(self.data.len() as u16).to_be_bytes()); // write size
+            data[3..3 + self.data.len()].copy_from_slice(&self.data);
+        }
+
+        data
+    }
+    pub fn put_data(&mut self, data: &[u8]) {
+        /* overflowed */
+        if data.len() > OVERFLOWPAGE_AVAILABLE_SIZE {
+            self.data = data[..OVERFLOWED_OVERFLOWPAGE_AVAILABLE_SIZE].to_owned();
+        } else {
+            self.data = data.to_owned();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -335,7 +449,7 @@ impl PageManage {
                     return page_count;
                 }
             } else {
-                self.alloc_with_count(device, page_count, PageType::General);
+                self.alloc(device, PageType::General);
                 self.get(device, page_count).unwrap().borrow_mut().data[0] = page_type;
                 return page_count;
             }

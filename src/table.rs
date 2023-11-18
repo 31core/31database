@@ -58,20 +58,44 @@ impl Table {
             let content_page = ContentPage::load(&mgr.get_data(device, content_page_count));
 
             if i < self.value_types.len() - 1 {
-                rec.values.push(Value::new(
-                    ValueType::Bytes,
-                    &content_page.entries[offset as usize].data[8..],
-                ));
+                let mut data = Vec::new();
+                data.extend(&content_page.entries[offset as usize].data);
+
+                if let Some(overflow_page) = content_page.entries[offset as usize].overflow_page {
+                    let mut page = OverflowPage::load(&mgr.get_data(device, overflow_page));
+                    data.extend(page.data);
+                    loop {
+                        if let Some(next) = page.next {
+                            page = OverflowPage::load(&mgr.get_data(device, next));
+                            data.extend(page.data);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                rec.values.push(Value::new(ValueType::Bytes, &data));
                 (content_page_count, offset) = location_from_u64(u64::from_be_bytes(
                     content_page.entries[offset as usize].data[0..8]
                         .try_into()
                         .unwrap(),
                 ));
             } else {
-                rec.values.push(Value::new(
-                    ValueType::Bytes,
-                    &content_page.entries[offset as usize].data,
-                ));
+                let mut data = Vec::new();
+                data.extend(&content_page.entries[offset as usize].data);
+
+                if let Some(overflow_page) = content_page.entries[offset as usize].overflow_page {
+                    let mut page = OverflowPage::load(&mgr.get_data(device, overflow_page));
+                    data.extend(page.data);
+                    loop {
+                        if let Some(next) = page.next {
+                            page = OverflowPage::load(&mgr.get_data(device, next));
+                            data.extend(page.data);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                rec.values.push(Value::new(ValueType::Bytes, &data));
             }
         }
 
@@ -84,14 +108,10 @@ impl Table {
     {
         let rowid = self.root_node.find_unused(device, mgr);
 
-        let mut page_count;
-        page_count = mgr.find_page_by_type(device, 0, PAGE_TYPEID_CONTENT);
+        let mut page_count = mgr.find_page_by_type(device, 0, PAGE_TYPEID_CONTENT);
         let mut last_location: Option<u64> = None;
         for (count, val) in rec.values.iter().enumerate() {
-            let mut entry = ContentEntry {
-                data: val.data.clone(),
-                ..Default::default()
-            };
+            let mut entry = ContentEntry::from_bytes(device, mgr, &val.data);
 
             if count < rec.values.len() - 1 {
                 entry.data = {

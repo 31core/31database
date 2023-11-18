@@ -8,3 +8,4 @@ name = "31database"
 path = "src/main.rs"
 
 [dependencies]
+sql-parser = { path = "sql-parser" }
