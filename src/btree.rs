@@ -1,5 +1,5 @@
 use crate::page::*;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Result as IOResult, Seek, Write};
 
 const MAX_IDS: usize = PAGE_SIZE / (8 + 8) - 1;
 const UNIT_SIZE: usize = 8 + 8;
@@ -65,7 +65,10 @@ impl BtreeNode {
             self.push(id, ptr);
         } else {
             for (i, _) in self.ids.iter().enumerate() {
-                if i < self.len() - 1 && id > self.ids[i] && id < self.ids[i + 1]
+                if i == 0 {
+                    self.insert(0, id, ptr);
+                    break;
+                } else if i < self.len() - 1 && id > self.ids[i] && id < self.ids[i + 1]
                     || i == self.len() - 1
                 {
                     self.insert(i + 1, id, ptr);
@@ -79,7 +82,7 @@ impl BtreeNode {
      * Return:
      * * node ID of the right node
      * * page count of the right node */
-    fn part<D>(&mut self, device: &mut D, mgr: &mut PageManage) -> (u64, u64)
+    fn part<D>(&mut self, device: &mut D, mgr: &mut PageManage) -> IOResult<(u64, u64)>
     where
         D: Write + Read + Seek,
     {
@@ -88,25 +91,31 @@ impl BtreeNode {
             another.insert(0, self.ids.pop().unwrap(), self.ptrs.pop().unwrap());
         }
 
-        let another_page = mgr.alloc(device, PageType::BtreePage);
+        let another_page = mgr.alloc(device, PageType::BtreePage)?;
         another.page_count = another_page.borrow().count;
         another_page.borrow_mut().modify(&another.dump());
-        mgr.modify(device, self.page_count, &self.dump());
+        mgr.modify(device, self.page_count, &self.dump())?;
 
-        (*another.ids.first().unwrap(), another.page_count)
+        Ok((*another.ids.first().unwrap(), another.page_count))
     }
     /** Insert an id into B-Tree */
-    pub fn insert_id<D>(&mut self, device: &mut D, mgr: &mut PageManage, id: u64, value: u64)
+    pub fn insert_id<D>(
+        &mut self,
+        device: &mut D,
+        mgr: &mut PageManage,
+        id: u64,
+        value: u64,
+    ) -> IOResult<()>
     where
         D: Write + Read + Seek,
     {
-        if let Some((id, page)) = self.insert_id_nontop(device, mgr, id, value) {
+        if let Some((id, page)) = self.insert_id_nontop(device, mgr, id, value)? {
             let mut left = Self::new_node(self.node_type);
             for i in 0..self.len() {
                 left.push(self.ids[i], self.ptrs[i]);
             }
 
-            let left_page = mgr.alloc(device, PageType::BtreePage);
+            let left_page = mgr.alloc(device, PageType::BtreePage)?;
             left.page_count = left_page.borrow().count;
             left_page.borrow_mut().modify(&left.dump());
 
@@ -114,8 +123,9 @@ impl BtreeNode {
             self.node_type = PAGE_TYPEID_BTREE_INTERNAL;
             self.push(*left.ids.first().unwrap(), left_page.borrow().count);
             self.push(id, page);
-            mgr.modify(device, self.page_count, &self.dump());
+            mgr.modify(device, self.page_count, &self.dump())?;
         }
+        Ok(())
     }
     /** Insert an id
      *
@@ -129,17 +139,17 @@ impl BtreeNode {
         mgr: &mut PageManage,
         id: u64,
         value: u64,
-    ) -> Option<(u64, u64)>
+    ) -> IOResult<Option<(u64, u64)>>
     where
         D: Write + Read + Seek,
     {
         if self.is_leaf() {
             self.add(id, value);
-            mgr.modify(device, self.page_count, &self.dump());
+            mgr.modify(device, self.page_count, &self.dump())?;
 
             /* part into two child nodes */
             if self.len() >= MAX_IDS {
-                return Some(self.part(device, mgr));
+                return Ok(Some(self.part(device, mgr)?));
             }
         } else {
             /* find child node to insert */
@@ -150,21 +160,21 @@ impl BtreeNode {
                     let child = mgr.get(device, self.ptrs[i]).unwrap();
                     let mut child_node = Self::new(child.borrow().count, &child.borrow().data);
                     /* if parted into tow sub trees */
-                    if let Some((id, page)) = child_node.insert_id_nontop(device, mgr, id, value) {
+                    if let Some((id, page)) = child_node.insert_id_nontop(device, mgr, id, value)? {
                         self.add(id, page);
-                        mgr.modify(device, self.page_count, &self.dump());
+                        mgr.modify(device, self.page_count, &self.dump())?;
                     }
 
                     if self.len() >= MAX_IDS {
-                        return Some(self.part(device, mgr));
+                        return Ok(Some(self.part(device, mgr)?));
                     }
                 }
             }
         }
-        None
+        Ok(None)
     }
     /** Remove an id from B-Tree */
-    pub fn remove_id<D>(&mut self, device: &mut D, mgr: &mut PageManage, id: u64)
+    pub fn remove_id<D>(&mut self, device: &mut D, mgr: &mut PageManage, id: u64) -> IOResult<()>
     where
         D: Write + Read + Seek,
     {
@@ -176,7 +186,7 @@ impl BtreeNode {
                     let child_page = mgr.get(device, self.ptrs[i]).unwrap();
                     let mut child_node =
                         Self::new(child_page.borrow().count, &child_page.borrow().data);
-                    child_node.remove_id(device, mgr, id);
+                    child_node.remove_id(device, mgr, id)?;
                     /* when child_node is empty, self.len() must be 0 */
                     if child_node.is_empty() {
                         self.remove(i);
@@ -234,7 +244,7 @@ impl BtreeNode {
                             next_node_page.borrow_mut().modify(&next_node.dump());
                         }
                     }
-                    mgr.modify(device, self.page_count, &self.dump());
+                    mgr.modify(device, self.page_count, &self.dump())?;
                 }
             }
         } else {
@@ -242,11 +252,12 @@ impl BtreeNode {
             for i in 0..self.len() {
                 if self.ids[i] == id {
                     self.remove(i);
-                    mgr.modify(device, self.page_count, &self.dump());
+                    mgr.modify(device, self.page_count, &self.dump())?;
                     break;
                 }
             }
         }
+        Ok(())
     }
     /** Find pointer by id */
     pub fn find_id<D>(&self, device: &mut D, mgr: &mut PageManage, id: u64) -> Option<u64>

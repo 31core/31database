@@ -122,7 +122,7 @@ pub struct ContentEntry {
 }
 
 impl ContentEntry {
-    pub fn from_bytes<D>(device: &mut D, mgr: &mut PageManage, data: &[u8]) -> Self
+    pub fn from_bytes<D>(device: &mut D, mgr: &mut PageManage, data: &[u8]) -> IOResult<Self>
     where
         D: Write + Read + Seek,
     {
@@ -135,7 +135,7 @@ impl ContentEntry {
 
             let mut last_count = None;
             let mut last_page: Option<OverflowPage> = None;
-            let mut overflow_page_count = mgr.alloc(device, PageType::OverflowPage).borrow().count;
+            let mut overflow_page_count = mgr.alloc(device, PageType::OverflowPage)?.borrow().count;
             entry.overflow_page = Some(overflow_page_count);
             loop {
                 let mut overflow_page = OverflowPage::default();
@@ -148,7 +148,7 @@ impl ContentEntry {
                 overflow_page.put_data(data);
                 if let Some(count) = last_count {
                     if let Some(page) = &last_page {
-                        mgr.modify(device, count, &page.dump());
+                        mgr.modify(device, count, &page.dump())?;
                     }
                 }
 
@@ -157,15 +157,15 @@ impl ContentEntry {
                 data = &data[overflow_page.data.len()..];
 
                 if data.is_empty() {
-                    mgr.modify(device, overflow_page_count, &overflow_page.dump());
+                    mgr.modify(device, overflow_page_count, &overflow_page.dump())?;
                     break;
                 }
-                overflow_page_count = mgr.alloc(device, PageType::OverflowPage).borrow().count;
+                overflow_page_count = mgr.alloc(device, PageType::OverflowPage)?.borrow().count;
             }
         } else {
             entry.data = data.to_owned();
         }
-        entry
+        Ok(entry)
     }
     /** Summary used size (not including overflowed part) */
     pub fn total_size(&self) -> usize {
@@ -332,14 +332,14 @@ pub struct PageManage {
 
 impl PageManage {
     /** Find ot allocate an unused page */
-    fn find_unused_page<D>(&mut self, device: &mut D) -> u64
+    fn find_unused_page<D>(&mut self, device: &mut D) -> IOResult<u64>
     where
         D: Write + Read + Seek,
     {
         let mut bitmap_count = 0;
         loop {
             let mut bitmap_page = BitmapPage::new(bitmap_count);
-            if let Some(page) = self.get(device, bitmap_count) {
+            if let Ok(page) = self.get(device, bitmap_count) {
                 bitmap_page.page = *page.borrow();
             } else {
                 bitmap_page.page = *self
@@ -349,27 +349,27 @@ impl PageManage {
             bitmap_page.set_used(0); // set bitmap page as used
             if let Some(count) = bitmap_page.find_unused() {
                 bitmap_page.set_used(count);
-                self.modify(device, bitmap_count, &bitmap_page.page.data);
+                self.modify(device, bitmap_count, &bitmap_page.page.data)?;
                 let count = count + bitmap_count;
-                return count;
+                return Ok(count);
             }
             bitmap_count += BITMAP_MANAGED_SIZE as u64 + 1;
         }
     }
     /** Allocate a new page */
-    pub fn alloc<D>(&mut self, device: &mut D, page_type: PageType) -> Rc<RefCell<Page>>
+    pub fn alloc<D>(&mut self, device: &mut D, page_type: PageType) -> IOResult<Rc<RefCell<Page>>>
     where
         D: Write + Read + Seek,
     {
         self.limit_cache(device);
-        let count = self.find_unused_page(device);
+        let count = self.find_unused_page(device)?;
         let page = Page::new(count, page_type);
         let count = page.count;
         self.cache_pages.push(count);
 
         self.pages.insert(page.count, Rc::new(RefCell::new(page)));
 
-        Rc::clone(self.pages.get(&count).unwrap())
+        Ok(Rc::clone(self.pages.get(&count).unwrap()))
     }
     /** Allocate a new page with specified count */
     pub fn alloc_with_count<D>(
@@ -391,12 +391,12 @@ impl PageManage {
         Rc::clone(self.pages.get(&count).unwrap())
     }
     /** Get page by count */
-    pub fn get<D>(&mut self, device: &mut D, page_count: u64) -> Option<Rc<RefCell<Page>>>
+    pub fn get<D>(&mut self, device: &mut D, page_count: u64) -> IOResult<Rc<RefCell<Page>>>
     where
         D: Write + Read + Seek,
     {
         if let Some(page) = self.pages.get(&page_count) {
-            return Some(Rc::clone(page));
+            return Ok(Rc::clone(page));
         }
         /* page does not loaded into memory */
         self.limit_cache(device);
@@ -405,7 +405,7 @@ impl PageManage {
             self.cache_pages.push(page_count);
             self.pages.insert(page_count, Rc::new(RefCell::new(page)));
         } else {
-            return None;
+            return Err(Error::new(ErrorKind::Other, ""));
         }
         self.get(device, page_count)
     }
@@ -433,7 +433,12 @@ impl PageManage {
         bitmap_page.unwrap().borrow_mut().modify(&bitmap.page.data);
     }
     /** Find or allocate a page by type */
-    pub fn find_page_by_type<D>(&mut self, device: &mut D, start: u64, page_type: u8) -> u64
+    pub fn find_page_by_type<D>(
+        &mut self,
+        device: &mut D,
+        start: u64,
+        page_type: u8,
+    ) -> IOResult<u64>
     where
         D: Write + Read + Seek,
     {
@@ -444,34 +449,37 @@ impl PageManage {
                 page_count += 1;
                 continue;
             }
-            if let Some(page) = self.get(device, page_count) {
+            if let Ok(page) = self.get(device, page_count) {
                 if page.borrow().data[0] == page_type {
-                    return page_count;
+                    return Ok(page_count);
                 }
             } else {
-                self.alloc(device, PageType::General);
+                self.alloc(device, PageType::General)?;
                 self.get(device, page_count).unwrap().borrow_mut().data[0] = page_type;
-                return page_count;
+                return Ok(page_count);
             }
             page_count += 1;
         }
     }
     /** Modify a apge */
-    pub fn modify<D>(&mut self, device: &mut D, page_count: u64, data: &[u8; PAGE_SIZE])
+    pub fn modify<D>(
+        &mut self,
+        device: &mut D,
+        page_count: u64,
+        data: &[u8; PAGE_SIZE],
+    ) -> IOResult<()>
     where
         D: Write + Read + Seek,
     {
-        self.get(device, page_count)
-            .unwrap()
-            .borrow_mut()
-            .modify(data);
+        self.get(device, page_count)?.borrow_mut().modify(data);
+        Ok(())
     }
     /** Get page data */
-    pub fn get_data<D>(&mut self, device: &mut D, page_count: u64) -> [u8; PAGE_SIZE]
+    pub fn get_data<D>(&mut self, device: &mut D, page_count: u64) -> IOResult<[u8; PAGE_SIZE]>
     where
         D: Write + Read + Seek,
     {
-        self.get(device, page_count).unwrap().borrow().data
+        Ok(self.get(device, page_count)?.borrow().data)
     }
     /** Limit the cache size to self.cache_size */
     fn limit_cache<D>(&mut self, device: &mut D)
